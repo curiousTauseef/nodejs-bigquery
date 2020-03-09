@@ -27,6 +27,7 @@ import {describe, it} from 'mocha';
 import Big from 'big.js';
 import {EventEmitter} from 'events';
 import * as extend from 'extend';
+import * as pReflect from 'p-reflect';
 import * as proxyquire from 'proxyquire';
 import * as sinon from 'sinon';
 import * as stream from 'stream';
@@ -36,9 +37,9 @@ import {BigQuery, Query} from '../src/bigquery';
 import {Job, JobOptions} from '../src/job';
 import {
   CopyTableMetadata,
+  InsertRowsResponse,
   JobLoadMetadata,
   Table,
-  TableMetadata,
   ViewDefinition,
 } from '../src/table';
 import bigquery from '../src/types';
@@ -60,6 +61,7 @@ const fakePfy = extend({}, pfy, {
     if (c.name === 'Table') {
       promisified = true;
     }
+    pfy.promisifyAll(c);
   },
 });
 
@@ -652,18 +654,21 @@ describe('BigQuery/Table', () => {
       DEST_TABLE = new Table(DATASET, 'destination-table');
     });
 
-    it('should throw if a destination is not a Table', () => {
-      assert.throws(() => {
-        table.createCopyJob();
-      }, /Destination must be a Table/);
+    it('should throw if a destination is not a Table', async () => {
+      await assert.rejects(
+        async () => table.createCopyJob(),
+        /Destination must be a Table/
+      );
 
-      assert.throws(() => {
-        table.createCopyJob({});
-      }, /Destination must be a Table/);
+      await assert.rejects(
+        async () => table.createCopyJob({}),
+        /Destination must be a Table/
+      );
 
-      assert.throws(() => {
-        table.createCopyJob(() => {});
-      }, /Destination must be a Table/);
+      await assert.rejects(
+        async () => table.createCopyJob(() => {}),
+        /Destination must be a Table/
+      );
     });
 
     it('should send correct request to the API', done => {
@@ -765,22 +770,26 @@ describe('BigQuery/Table', () => {
       SOURCE_TABLE = new Table(DATASET, 'source-table');
     });
 
-    it('should throw if a source is not a Table', () => {
-      assert.throws(() => {
-        table.createCopyFromJob(['table']);
-      }, /Source must be a Table/);
+    it('should throw if a source is not a Table', async () => {
+      await assert.rejects(
+        async () => table.createCopyFromJob(['table']),
+        /Source must be a Table/
+      );
 
-      assert.throws(() => {
-        table.createCopyFromJob([SOURCE_TABLE, 'table']);
-      }, /Source must be a Table/);
+      await assert.rejects(
+        async () => table.createCopyFromJob([SOURCE_TABLE, 'table']),
+        /Source must be a Table/
+      );
 
-      assert.throws(() => {
-        table.createCopyFromJob({});
-      }, /Source must be a Table/);
+      await assert.rejects(
+        async () => table.createCopyFromJob({}),
+        /Source must be a Table/
+      );
 
-      assert.throws(() => {
-        table.createCopyFromJob(() => {});
-      }, /Source must be a Table/);
+      await assert.rejects(
+        async () => table.createCopyFromJob(() => {}),
+        /Source must be a Table/
+      );
     });
 
     it('should send correct request to the API', done => {
@@ -1178,9 +1187,31 @@ describe('BigQuery/Table', () => {
       });
     });
 
+    // TODO this doesn't work without promises or callbacks, refactor as
+    //  createLoadJobStream, see #640
+    /*
     it('should return a stream when a string is given', () => {
       sandbox.stub(table, 'createWriteStream_').returns(new stream.Writable());
-      assert(table.createLoadJob(FILEPATH) instanceof stream.Stream);
+      const result = table.createLoadJob(FILEPATH);
+      assert(result instanceof stream.Writable);
+      result.emit('job', {metadata: 'foo'});
+    });
+    */
+
+    it('should return a stream when a string is given using callback', done => {
+      // TODO refactor Writable return as createLoadJobStream
+      sandbox.stub(table, 'createWriteStream_').returns(new stream.Writable());
+      const result = table.createLoadJob(FILEPATH, done);
+      assert(result instanceof stream.Writable);
+      result.emit('job', {metadata: 'foo'});
+    });
+
+    it('should return a stream when a string is given using async', async () => {
+      // TODO refactor Writable return as createLoadJobStream
+      sandbox.stub(table, 'createWriteStream_').returns(new stream.Writable());
+      const result = await table.createLoadJob(FILEPATH, () => {});
+      assert(result instanceof stream.Writable);
+      result.emit('job', {metadata: 'foo'});
     });
 
     it('should infer the file format from the given filepath', done => {
@@ -1241,14 +1272,14 @@ describe('BigQuery/Table', () => {
       table.createLoadJob(FILE, assert.ifError);
     });
 
-    it('should throw if a File object is not provided', () => {
+    it('should throw if a File object is not provided', async () => {
       isCustomTypeOverride = () => {
         return false;
       };
-
-      assert.throws(() => {
-        table.createLoadJob({});
-      }, /Source must be a File object/);
+      await assert.rejects(
+        async () => table.createLoadJob({}),
+        /Source must be a File object/
+      );
     });
 
     it('should convert File objects to gs:// urls', done => {
@@ -2014,54 +2045,104 @@ describe('BigQuery/Table', () => {
       }),
     };
 
+    // HACK @types/sinon is missing the timer async methods
+    interface SinonFakeTimersShim extends sinon.SinonFakeTimers {
+      runAllAsync(): Promise<number>;
+      tickAsync(ms: number | string): Promise<number>;
+    }
+
+    let clock: SinonFakeTimersShim;
+    let requestStub: sinon.SinonStub;
+
+    before(() => {
+      clock = sinon.useFakeTimers() as SinonFakeTimersShim;
+    });
+
     beforeEach(() => {
+      requestStub = sinon.stub(table, 'request').resolves([{}]);
       fakeUuid.v4 = () => {
         return fakeInsertId;
       };
     });
 
-    it('should throw an error if rows is empty', () => {
-      assert.throws(() => {
-        table.insert([]);
-      }, /You must provide at least 1 row to be inserted\./);
+    afterEach(() => {
+      clock.reset();
     });
 
-    it('should save data', done => {
-      table.request = (reqOpts: DecorateRequestOptions) => {
-        assert.strictEqual(reqOpts.method, 'POST');
-        assert.strictEqual(reqOpts.uri, '/insertAll');
-        assert.deepStrictEqual(reqOpts.json, dataApiFormat);
-        done();
-      };
-
-      table.insert(data, done);
+    after(() => {
+      clock.restore();
     });
 
-    it('should generate insertId', done => {
-      table.request = (reqOpts: DecorateRequestOptions) => {
-        assert.strictEqual(reqOpts.json.rows[0].insertId, fakeInsertId);
-        done();
-      };
+    /**
+     * Only use this method when NOT directly awaiting on `table.insert`, i.e.
+     * when relying on any of the fake timer async helpers.
+     * Tests should assert isRejected or isFulfilled.
+     * @ignore
+     * @param fn
+     * @returns {Promise<pReflect.PromiseResult<any>>}
+     */
+    async function reflectAfterTimer<FnReturn>(
+      fn: () => Promise<FnReturn>
+    ): Promise<pReflect.PromiseResult<FnReturn>> {
+      /*
+        When `fn` rejects/throws, we need to capture this and test
+        for it as needed. Using reflection avoids try/catch's potential for
+        false-positives.
 
-      table.insert([data[0]], done);
+        Also, defer capturing the settled promise until _after_ the
+        internal timer (delay) has been completed.
+       */
+      const fnPromise: Promise<FnReturn> = fn();
+      const reflectedPromise: Promise<pReflect.PromiseResult<
+        FnReturn
+      >> = pReflect(fnPromise);
+
+      await clock.runAllAsync();
+      return reflectedPromise;
+    }
+
+    it('should throw an error if rows is empty', async () => {
+      await assert.rejects(
+        async () => table.insert([]),
+        /You must provide at least 1 row to be inserted/
+      );
     });
 
-    it('should omit the insertId if createInsertId is false', done => {
-      table.request = ({json}: DecorateRequestOptions) => {
-        assert.strictEqual(json.rows[0].insertId, undefined);
-        assert.strictEqual(json.createInsertId, undefined);
-        done();
-      };
+    it('should save data', async () => {
+      await table.insert(data);
+      assert(
+        requestStub.calledOnceWithExactly({
+          method: 'POST',
+          uri: '/insertAll',
+          json: dataApiFormat,
+        })
+      );
+    });
 
-      table.insert([data[0]], {createInsertId: false}, done);
+    it('should generate insertId', async () => {
+      await table.insert([data[0]]);
+      assert(
+        requestStub.calledOnceWith(
+          sinon.match.hasNested('json.rows[0].insertId', fakeInsertId)
+        )
+      );
+    });
+
+    it('should omit the insertId if createInsertId is false', async () => {
+      await table.insert([data[0]], {createInsertId: false});
+      assert(requestStub.calledOnce);
+      assert(
+        requestStub.calledWithMatch(
+          ({json}: DecorateRequestOptions) =>
+            json.rows[0].insertId === undefined &&
+            json.createdInsertId === undefined
+        )
+      );
     });
 
     it('should execute callback with API response', done => {
       const apiResponse = {insertErrors: []};
-
-      table.request = (reqOpts: DecorateRequestOptions, callback: Function) => {
-        callback(null, apiResponse);
-      };
+      requestStub.resolves([apiResponse]);
 
       table.insert(data, (err: Error, apiResponse_: {}) => {
         assert.ifError(err);
@@ -2072,86 +2153,82 @@ describe('BigQuery/Table', () => {
 
     it('should execute callback with error & API response', done => {
       const error = new Error('Error.');
-      const apiResponse = {};
-
-      table.request = (reqOpts: DecorateRequestOptions, callback: Function) => {
-        callback(error, apiResponse);
-      };
+      requestStub.rejects(error);
 
       table.insert(data, (err: Error, apiResponse_: {}) => {
         assert.strictEqual(err, error);
-        assert.strictEqual(apiResponse_, apiResponse);
+        assert.strictEqual(apiResponse_, null);
         done();
       });
     });
 
-    it('should return partial failures', done => {
+    it('should reject with API error', async () => {
+      const error = new Error('Error.');
+      requestStub.rejects(error);
+      await assert.rejects(async () => table.insert(data), error);
+    });
+
+    it('should return partial failures', async () => {
       const row0Error = {message: 'Error.', reason: 'notFound'};
       const row1Error = {message: 'Error.', reason: 'notFound'};
-
-      table.request = (reqOpts: DecorateRequestOptions, callback: Function) => {
-        callback(null, {
+      requestStub.resolves([
+        {
           insertErrors: [
             {index: 0, errors: [row0Error]},
             {index: 1, errors: [row1Error]},
           ],
-        });
-      };
+        },
+      ]);
 
-      table.insert(data, (err: Error) => {
-        assert.strictEqual(err.name, 'PartialFailureError');
-
-        assert.deepStrictEqual(((err as {}) as GoogleErrorBody).errors, [
-          {
-            row: dataApiFormat.rows[0].json,
-            errors: [row0Error],
-          },
-          {
-            row: dataApiFormat.rows[1].json,
-            errors: [row1Error],
-          },
-        ]);
-
-        done();
-      });
+      const reflection = await reflectAfterTimer(() => table.insert(data));
+      assert(reflection.isRejected);
+      const {reason} = reflection as pReflect.PromiseRejectedResult;
+      assert.deepStrictEqual((reason as GoogleErrorBody).errors, [
+        {
+          row: dataApiFormat.rows[0].json,
+          errors: [row0Error],
+        },
+        {
+          row: dataApiFormat.rows[1].json,
+          errors: [row1Error],
+        },
+      ]);
     });
 
-    it('should insert raw data', done => {
-      table.request = (reqOpts: DecorateRequestOptions) => {
-        assert.strictEqual(reqOpts.method, 'POST');
-        assert.strictEqual(reqOpts.uri, '/insertAll');
-        assert.deepStrictEqual(reqOpts.json, {rows: rawData});
-        assert.strictEqual(reqOpts.json.raw, undefined);
-        done();
-      };
-
+    it('should insert raw data', async () => {
       const opts = {raw: true};
-      table.insert(rawData, opts, done);
+      await table.insert(rawData, opts);
+      assert(requestStub.calledOnce);
+
+      const [reqOpts]: DecorateRequestOptions[] = requestStub.firstCall.args;
+      assert.strictEqual(reqOpts.method, 'POST');
+      assert.strictEqual(reqOpts.uri, '/insertAll');
+      assert.deepStrictEqual(reqOpts.json, {rows: rawData});
+      assert.strictEqual(reqOpts.json.raw, undefined);
     });
 
-    it('should accept options', done => {
+    it('should accept options', async () => {
       const opts = {
         ignoreUnknownValues: true,
         skipInvalidRows: true,
         templateSuffix: 'test',
       };
 
-      table.request = (reqOpts: DecorateRequestOptions) => {
-        assert.strictEqual(reqOpts.method, 'POST');
-        assert.strictEqual(reqOpts.uri, '/insertAll');
+      await table.insert(data, opts);
+      assert(requestStub.calledOnce);
 
-        assert.strictEqual(
-          reqOpts.json.ignoreUnknownValues,
-          opts.ignoreUnknownValues
-        );
-        assert.strictEqual(reqOpts.json.skipInvalidRows, opts.skipInvalidRows);
-        assert.strictEqual(reqOpts.json.templateSuffix, opts.templateSuffix);
+      const [reqOpts]: DecorateRequestOptions[] = requestStub.firstCall.args;
+      assert.strictEqual(reqOpts.method, 'POST');
+      assert.strictEqual(reqOpts.uri, '/insertAll');
 
-        assert.deepStrictEqual(reqOpts.json.rows, dataApiFormat.rows);
-        done();
-      };
+      assert.strictEqual(
+        reqOpts.json.ignoreUnknownValues,
+        opts.ignoreUnknownValues
+      );
+      assert.strictEqual(reqOpts.json.skipInvalidRows, opts.skipInvalidRows);
+      assert.strictEqual(reqOpts.json.templateSuffix, opts.templateSuffix);
 
-      table.insert(data, opts, done);
+      assert.deepStrictEqual(reqOpts.json.rows, dataApiFormat.rows);
     });
 
     describe('create table and retry', () => {
@@ -2159,128 +2236,115 @@ describe('BigQuery/Table', () => {
         schema: SCHEMA_STRING,
       };
 
-      // tslint:disable-next-line no-any
-      let _setTimeout: any;
-      // tslint:disable-next-line no-any
-      let _random: any;
-
-      before(() => {
-        _setTimeout = global.setTimeout;
-        _random = Math.random;
-      });
+      let createStub: sinon.SinonStub;
+      let insertSpy: sinon.SinonSpy;
 
       beforeEach(() => {
-        sandbox.stub(global, 'setTimeout').callsFake(cb => {
-          cb();
-          return {} as NodeJS.Timeout;
-        });
-        Math.random = _random;
-        table.request = (
-          reqOpts: DecorateRequestOptions,
-          callback: Function
-        ) => {
-          callback({code: 404});
-        };
-        table.create = (reqOpts: TableMetadata, callback: Function) => {
-          callback(null);
-        };
+        insertSpy = sinon.spy(table, 'insert');
+        createStub = sinon.stub(table, 'create').resolves([{}]);
+        requestStub.onFirstCall().rejects({code: 404});
       });
 
-      after(() => {
-        global.setTimeout = _setTimeout;
-        Math.random = _random;
+      afterEach(() => {
+        insertSpy.restore();
+        createStub.restore();
       });
 
-      it('should not include the schema in the insert request', done => {
-        table.request = (reqOpts: DecorateRequestOptions) => {
-          assert.strictEqual(reqOpts.json.schema, undefined);
-          done();
-        };
+      it('should not include the schema in the insert request', async () => {
+        requestStub.reset();
+        requestStub.resolves([{}]);
 
-        table.insert(data, OPTIONS, assert.ifError);
+        await table.insert(data, OPTIONS);
+        assert(requestStub.calledOnce);
+        assert.strictEqual(
+          requestStub.firstCall.lastArg.json.schema,
+          undefined
+        );
       });
 
-      it('should set a timeout to create the table', done => {
-        const fakeRandomValue = Math.random();
-
-        Math.random = () => {
-          return fakeRandomValue;
-        };
-
-        sandbox.restore();
-        sandbox.stub(global, 'setTimeout').callsFake((callback, delay) => {
-          assert.strictEqual(delay, fakeRandomValue * 60000);
-          callback();
-          return {} as NodeJS.Timeout;
-        });
-
-        table.create = (reqOpts: TableMetadata) => {
-          assert.strictEqual(reqOpts.schema, SCHEMA_STRING);
-          done();
-        };
-
-        table.insert(data, OPTIONS, assert.ifError);
+      it('should attempt to create table if not created', async () => {
+        const reflection = await reflectAfterTimer(() =>
+          table.insert(data, OPTIONS)
+        );
+        assert(reflection.isFulfilled);
+        assert(createStub.calledOnce);
+        assert.strictEqual(createStub.firstCall.lastArg.schema, SCHEMA_STRING);
       });
 
-      it('should return table creation errors', done => {
+      it('should set a timeout to insert rows in the created table', async () => {
+        // the implementation uses an explicit 60s delay
+        // so this tests at various intervals
+        const expectedDelay = 60000;
+        const firstCheckDelay = 50000;
+        const remainingCheckDelay = expectedDelay - firstCheckDelay;
+
+        pReflect(table.insert(data, OPTIONS)); // gracefully handle async errors
+        assert(insertSpy.calledOnce); // just called `insert`, that's 1 so far
+
+        await clock.tickAsync(firstCheckDelay); // first 50s
+        assert(insertSpy.calledOnce);
+        assert(createStub.calledOnce, 'must create table before inserting');
+
+        await clock.tickAsync(remainingCheckDelay); // first 50s + 10s = 60s
+        assert(insertSpy.calledTwice);
+        assert.strictEqual(insertSpy.secondCall.args[0], data);
+        assert.strictEqual(insertSpy.secondCall.args[1], OPTIONS);
+
+        await clock.runAllAsync(); // for good measure
+        assert(insertSpy.calledTwice, 'should not have called insert again');
+      });
+
+      it('should reject on table creation errors', async () => {
         const error = new Error('err.');
-        const response = {};
+        createStub.rejects(error);
 
-        table.create = (reqOpts: TableMetadata, callback: Function) => {
-          callback(error, null, response);
-        };
+        const reflection = await reflectAfterTimer(() =>
+          table.insert(data, OPTIONS)
+        );
+        assert(reflection.isRejected);
 
-        table.insert(data, OPTIONS, (err: Error, resp: {}) => {
-          assert.strictEqual(err, error);
-          assert.strictEqual(resp, response);
-          done();
-        });
+        const {reason} = reflection as pReflect.PromiseRejectedResult;
+        assert.strictEqual(reason, error);
       });
 
-      it('should ignore 409 errors', done => {
-        table.create = (reqOpts: TableMetadata, callback: Function) => {
-          callback({code: 409});
-        };
+      it('should ignore 409 errors', async () => {
+        createStub.rejects({code: 409});
 
-        let timeouts = 0;
-        sandbox.restore();
-        sandbox.stub(global, 'setTimeout').callsFake((callback, delay) => {
-          if (++timeouts === 2) {
-            assert.strictEqual(delay, 60000);
-            done();
-          }
-          callback(null);
-          return {} as NodeJS.Timeout;
-        });
-
-        table.insert(data, OPTIONS, assert.ifError);
+        const reflection = await reflectAfterTimer(() =>
+          table.insert(data, OPTIONS)
+        );
+        assert(reflection.isFulfilled);
+        assert(createStub.calledOnce);
+        assert(insertSpy.calledTwice);
+        assert.strictEqual(insertSpy.secondCall.args[0], data);
+        assert.strictEqual(insertSpy.secondCall.args[1], OPTIONS);
       });
 
-      it('should retry the insert', done => {
-        const response = {};
-        let attempts = 0;
+      it('should retry the insert', async () => {
+        const errorResponse = {code: 404};
+        requestStub.onFirstCall().rejects(errorResponse);
+        requestStub.onSecondCall().rejects(errorResponse);
 
-        table.request = (
-          reqOpts: DecorateRequestOptions,
-          callback: Function
-        ) => {
-          assert.strictEqual(reqOpts.method, 'POST');
-          assert.strictEqual(reqOpts.uri, '/insertAll');
-          assert.deepStrictEqual(reqOpts.json, dataApiFormat);
+        const goodResponse = [{foo: 'bar'}];
+        requestStub.onThirdCall().resolves(goodResponse);
 
-          if (++attempts === 2) {
-            callback(null, response);
-            return;
-          }
+        const reflection = await reflectAfterTimer(() =>
+          table.insert(data, OPTIONS)
+        );
+        assert(reflection.isFulfilled);
+        assert(requestStub.calledThrice);
+        assert(
+          requestStub.alwaysCalledWithMatch({
+            method: 'POST',
+            uri: '/insertAll',
+            json: dataApiFormat,
+          })
+        );
 
-          callback({code: 404});
-        };
-
-        table.insert(data, OPTIONS, (err: Error, resp: {}) => {
-          assert.ifError(err);
-          assert.strictEqual(resp, response);
-          done();
-        });
+        const {value} = reflection as pReflect.PromiseFulfilledResult<
+          InsertRowsResponse
+        >;
+        assert.deepStrictEqual(value, goodResponse);
       });
     });
   });
